@@ -205,6 +205,39 @@ def _get_basetenkenizer_for_kimi(tokenizer):
     return fast_tokenizer
 
 
+# Which fast-path methods have already logged a runtime failure -- logged
+# once per method, not per call, so a persistently bad input can't spam the
+# log once basetenkenizer starts failing on it.
+_fast_call_failure_logged = set()
+
+
+def _call_fast_or_fallback(method_name, fast_fn, fallback_fn):
+    """Run `fast_fn()`; on any exception, fall back to `fallback_fn()` for
+    just this call.
+
+    `_get_basetenkenizer_for_kimi` already handles "basetenkenizer failed to
+    *build*" by falling back to the native path for every call. This handles
+    the separate case of basetenkenizer building successfully but then
+    raising on some specific input at *call* time (a Rust-side panic/error on
+    a pathological input, say) -- without this, that would propagate
+    uncaught through TokenizerManager, a failure mode the native tiktoken
+    path never has.
+    """
+    try:
+        return fast_fn()
+    except Exception:
+        if method_name not in _fast_call_failure_logged:
+            _fast_call_failure_logged.add(method_name)
+            logger.exception(
+                "basetenkenizer raised while executing the patched %s; "
+                "falling back to the native tiktoken-based implementation "
+                "for this call (subsequent failures on this method will "
+                "fall back silently -- this warning won't repeat).",
+                method_name,
+            )
+        return fallback_fn()
+
+
 class _BasetenkenizerSpeedPatcher:
     """Swap Kimi's TikTokenTokenizer encode/decode/call/batch-decode leaf calls
     for basetenkenizer's Rust-backed equivalents, without touching chat
@@ -266,6 +299,13 @@ class _BasetenkenizerSpeedPatcher:
         without those, would silently switch TokenizerManager onto the slow
         generic `_tokenize`/id-string-id round trip for the regular batched
         path, which is strictly worse than today's direct `.encode()` loop.
+
+    Every fast-path call below goes through `_call_fast_or_fallback`: if
+    basetenkenizer built successfully but then raises on some specific input
+    at call time, that call (only) falls back to the original tiktoken-based
+    implementation instead of propagating the exception -- `basetenkenizer
+    built successfully` is not the same guarantee as `every input encodes/
+    decodes cleanly`.
     """
 
     _PATCHED_FLAG = "_sglang_basetenkenizer_speed_patched"
@@ -307,9 +347,15 @@ class _BasetenkenizerSpeedPatcher:
             # byte-identical against Kimi's own chunked output on both a 40k
             # highly-mergeable stress case and a real ~1M-token/~6M-char input),
             # so the whole text can go through in one call.
-            return fast_tokenizer.encode_segments(
-                [(text, allow_special_tokens)], tiktoken_safe=True
-            ).ids
+            return _call_fast_or_fallback(
+                "_encode_text_piece",
+                lambda: fast_tokenizer.encode_segments(
+                    [(text, allow_special_tokens)], tiktoken_safe=True
+                ).ids,
+                lambda: tokenizer_cls._original_encode_text_piece(
+                    self, text, allow_special_tokens=allow_special_tokens
+                ),
+            )
 
         def patched_decode(self, token_ids, **kwargs):
             if kwargs:
@@ -319,9 +365,12 @@ class _BasetenkenizerSpeedPatcher:
             if fast_tokenizer is None:
                 return tokenizer_cls._original_decode(self, token_ids)
 
-            if isinstance(token_ids, int):
-                token_ids = [token_ids]
-            return fast_tokenizer.decode(token_ids)
+            ids = [token_ids] if isinstance(token_ids, int) else token_ids
+            return _call_fast_or_fallback(
+                "decode",
+                lambda: fast_tokenizer.decode(ids),
+                lambda: tokenizer_cls._original_decode(self, token_ids),
+            )
 
         def patched_call(
             self,
@@ -345,18 +394,31 @@ class _BasetenkenizerSpeedPatcher:
                 and text_pair_target is None
                 and set(kwargs) <= cls._CALL_SUPPORTED_KWARGS
             ):
-                if isinstance(text, str):
-                    encodings = [fast_tokenizer.encode_segments([(text, True)])]
-                else:
+
+                def _fast():
+                    if isinstance(text, str):
+                        enc = fast_tokenizer.encode_segments([(text, True)])
+                        return {
+                            "input_ids": enc.ids,
+                            "attention_mask": enc.attention_mask,
+                        }
                     encodings = fast_tokenizer.encode_batch(list(text))
-                return {
-                    "input_ids": [e.ids for e in encodings]
-                    if not isinstance(text, str)
-                    else encodings[0].ids,
-                    "attention_mask": [e.attention_mask for e in encodings]
-                    if not isinstance(text, str)
-                    else encodings[0].attention_mask,
-                }
+                    return {
+                        "input_ids": [e.ids for e in encodings],
+                        "attention_mask": [e.attention_mask for e in encodings],
+                    }
+
+                def _fallback():
+                    return tokenizer_cls._original_call(
+                        self,
+                        text=text,
+                        text_pair=text_pair,
+                        text_target=text_target,
+                        text_pair_target=text_pair_target,
+                        **kwargs,
+                    )
+
+                return _call_fast_or_fallback("__call__", _fast, _fallback)
 
             return tokenizer_cls._original_call(
                 self,
@@ -390,18 +452,31 @@ class _BasetenkenizerSpeedPatcher:
             # path -- rather than trusting basetenkenizer's own
             # tokenizer.json-declared "special" flags, which were found to
             # disagree with Kimi's real runtime set for at least one token.
+            filtered_sequences = sequences
             if skip_special_tokens:
                 special_ids = getattr(self, "all_special_ids_set", None)
                 if special_ids is None:
                     special_ids = getattr(self, "all_special_ids", None)
                 if special_ids is not None:
                     special_ids_set = set(special_ids)
-                    sequences = [
+                    filtered_sequences = [
                         [tid for tid in ids if tid not in special_ids_set]
                         for ids in sequences
                     ]
 
-            return fast_tokenizer.decode_batch(sequences, skip_special_tokens=False)
+            return _call_fast_or_fallback(
+                "batch_decode",
+                lambda: fast_tokenizer.decode_batch(
+                    filtered_sequences, skip_special_tokens=False
+                ),
+                lambda: tokenizer_cls._original_batch_decode(
+                    self,
+                    sequences,
+                    skip_special_tokens=skip_special_tokens,
+                    spaces_between_special_tokens=spaces_between_special_tokens,
+                    **kwargs,
+                ),
+            )
 
         tokenizer_cls._encode_text_piece = patched_encode_text_piece
         tokenizer_cls.decode = patched_decode
