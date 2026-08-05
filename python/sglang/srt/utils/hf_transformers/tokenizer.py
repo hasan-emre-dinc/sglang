@@ -457,6 +457,28 @@ def _ensure_fastokens_patched():
     logger.info("fastokens backend enabled - transformers patched successfully")
 
 
+_basetenkenizer_patched = False
+
+
+def _ensure_basetenkenizer_patched():
+    """Monkey-patch transformers to use the basetenkenizer backend (once)."""
+    global _basetenkenizer_patched
+    if _basetenkenizer_patched:
+        return
+    try:
+        import basetenkenizer
+    except ImportError:
+        raise ImportError(
+            "The basetenkenizer package is required when "
+            "--tokenizer-backend=basetenkenizer. "
+            "Install it with: pip install 'sglang[basetenkenizer]'"
+        ) from None
+
+    basetenkenizer.patch_transformers()
+    _basetenkenizer_patched = True
+    logger.info("basetenkenizer backend enabled - transformers patched successfully")
+
+
 def get_tokenizer(
     tokenizer_name: str,
     *args,
@@ -475,6 +497,8 @@ def get_tokenizer(
 
     if tokenizer_backend == "fastokens":
         _ensure_fastokens_patched()
+    elif tokenizer_backend == "basetenkenizer":
+        _ensure_basetenkenizer_patched()
 
     if tokenizer_mode == "slow":
         if kwargs.get("use_fast", False):
@@ -518,12 +542,15 @@ def get_tokenizer(
                 tokenizer_name, *args, **common_kwargs
             )
 
-            # With fastokens, the patched TokenizersBackend.from_pretrained already
-            # returned a tokenizer whose backend is a fastokens shim. Re-resolving via
-            # the declared class (e.g. Qwen2Tokenizer) would discard that work.
+            # With fastokens or basetenkenizer, the patched TokenizersBackend.from_pretrained
+            # already returned a tokenizer whose backend is a fastokens/basetenkenizer shim.
+            # Both patch by swapping tokenizer._tokenizer in place and leaving the outer
+            # class as TokenizersBackend, so re-resolving via the declared class (e.g.
+            # Qwen2Tokenizer) here would silently discard that work.
             if (
                 type(tokenizer).__name__ == _TOKENIZERS_BACKEND
                 and tokenizer_backend != "fastokens"
+                and tokenizer_backend != "basetenkenizer"
             ):
                 tokenizer = _resolve_tokenizers_backend(
                     tokenizer_name, *args, **common_kwargs
@@ -537,6 +564,13 @@ def get_tokenizer(
                 f"This model's tokenizer may not be supported by fastokens — "
                 f"see https://github.com/crusoecloud/fastokens. "
                 f"Re-run without --tokenizer-backend=fastokens to use the default backend."
+            ) from e
+        if tokenizer_backend == "basetenkenizer":
+            raise RuntimeError(
+                f"basetenkenizer failed to load tokenizer for {tokenizer_name!r}. "
+                f"This model's tokenizer may not be supported by basetenkenizer — "
+                f"see https://huggingface.co/baseten/kimi-k3-tokenizer/tree/main. "
+                f"Re-run without --tokenizer-backend=basetenkenizer to use the default backend."
             ) from e
         raise
 

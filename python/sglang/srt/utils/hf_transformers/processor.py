@@ -150,6 +150,10 @@ def get_processor(
         from .tokenizer import _ensure_fastokens_patched
 
         _ensure_fastokens_patched()
+    elif tokenizer_backend == "basetenkenizer":
+        from .tokenizer import _ensure_basetenkenizer_patched
+
+        _ensure_basetenkenizer_patched()
 
     revision = kwargs.pop("revision", tokenizer_revision)
     tokenizer_name = resolve_runai_obj_uri(tokenizer_name)

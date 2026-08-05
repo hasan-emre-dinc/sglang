@@ -503,9 +503,12 @@ class ServerArgs:
         str,
         Arg(
             help="Tokenizer backend. 'huggingface' uses the default HuggingFace "
-            "tokenizers library, and 'fastokens' uses the fastokens library "
-            "for faster tokenization. Requires the fastokens package to be installed.",
-            choices=["huggingface", "fastokens"],
+            "tokenizers library, 'fastokens' uses the fastokens library "
+            "for faster tokenization (requires the fastokens package), and "
+            "'basetenkenizer' uses Baseten's basetenkenizer library, built for "
+            "Kimi K3's tiktoken-format tokenizer, for faster tokenization "
+            "(requires the basetenkenizer package).",
+            choices=["huggingface", "fastokens", "basetenkenizer"],
         ),
         NS("serving"),
     ] = "huggingface"
